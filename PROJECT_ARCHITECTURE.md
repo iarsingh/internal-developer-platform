@@ -14,7 +14,9 @@ This document describes files and symbols in this checkout. Deployment templates
 flowchart LR
     M0["src/plat/gate.py"]
     M1["src/plat/main.py"]
+    M2["src/plat/ops.py"]
     M1 -->|imports| M0
+    M1 -->|imports| M2
 ```
 
 For Python repositories, arrows show resolved local imports, not network calls or deployment order. Otherwise the diagram is a repository component map; containment arrows do not assert runtime integration.
@@ -24,20 +26,40 @@ For Python repositories, arrows show resolved local imports, not network calls o
 | Component | Responsibility |
 | --- | --- |
 | [`src/plat/main.py`](src/plat/main.py) | HTTP handlers: `GET /healthz`, `POST /check` |
+| [`src/plat/ops.py`](src/plat/ops.py) | HTTP handlers: `GET /readyz`, `POST /workspaces`, `GET /workspaces`, `POST /workspaces/{workspace_id}/jobs`, `GET /jobs/{job_id}` |
 | [`src/plat/gate.py`](src/plat/gate.py) | Functions: `check` |
 | [`requirements.txt`](requirements.txt) | Implementation or supporting configuration |
 | [`terraform/main.tf`](terraform/main.tf) | Terraform resource/module declarations |
 | [`web/src/App.tsx`](web/src/App.tsx) | User interface code/assets |
+| [`Dockerfile`](Dockerfile) | Container build/service configuration |
+| [`Makefile`](Makefile) | Implementation or supporting configuration |
+| [`docker-compose.yml`](docker-compose.yml) | Container build/service configuration |
 | [`tests/test_gate.py`](tests/test_gate.py) | Executable checks and regression examples |
+| [`tests/test_ops.py`](tests/test_ops.py) | Executable checks and regression examples |
 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | GitHub Actions job definitions |
 | [`README.md`](README.md) | Project explanations or operating notes |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Project explanations or operating notes |
+
+## Existing design and operating guides
+
+These checked-in guides provide the project’s detailed design, operational context, or deployment view:
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Request interface
 
 | Method and path | Handler | Source |
 | --- | --- | --- |
-| `GET /healthz` | `healthz` | [`src/plat/main.py`](src/plat/main.py#L6) |
-| `POST /check` | `post_check` | [`src/plat/main.py`](src/plat/main.py#L10) |
+| `GET /healthz` | `healthz` | [`src/plat/main.py`](src/plat/main.py#L8) |
+| `POST /check` | `post_check` | [`src/plat/main.py`](src/plat/main.py#L12) |
+| `GET /readyz` | `readyz` | [`src/plat/ops.py`](src/plat/ops.py#L44) |
+| `POST /workspaces` | `create_workspace` | [`src/plat/ops.py`](src/plat/ops.py#L49) |
+| `GET /workspaces` | `list_workspaces` | [`src/plat/ops.py`](src/plat/ops.py#L66) |
+| `POST /workspaces/{workspace_id}/jobs` | `create_job` | [`src/plat/ops.py`](src/plat/ops.py#L73) |
+| `GET /jobs/{job_id}` | `get_job` | [`src/plat/ops.py`](src/plat/ops.py#L96) |
+| `POST /jobs/{job_id}/approve` | `approve_job` | [`src/plat/ops.py`](src/plat/ops.py#L105) |
+| `GET /audit` | `audit` | [`src/plat/ops.py`](src/plat/ops.py#L122) |
+| `GET /metrics` | `metrics` | [`src/plat/ops.py`](src/plat/ops.py#L138) |
 
 The table lists literal route decorators found in the inspected Python modules. Router prefixes and middleware can add behavior; check the linked handler and application setup before calling an endpoint.
 
@@ -63,6 +85,23 @@ def check(body, approved=False):
     if not body.get("owner"): failed.append("owner")
     return {"passed": not failed, "failed": failed, "applied": False, "approved": bool(approved)}
 ```
+
+## Validation and failure paths
+
+| Explicit exception | Source |
+| --- | --- |
+| `HTTPException(status_code=404, detail='workspace not found')` | [`src/plat/ops.py`](src/plat/ops.py#L77) |
+| `HTTPException(status_code=404, detail='job not found')` | [`src/plat/ops.py`](src/plat/ops.py#L100) |
+| `HTTPException(status_code=404, detail='job not found')` | [`src/plat/ops.py`](src/plat/ops.py#L109) |
+| `HTTPException(status_code=403, detail='production apply is disabled in this lab')` | [`src/plat/ops.py`](src/plat/ops.py#L113) |
+
+These are explicit exceptions in the inspected source, rather than a claim that every failure is handled. Follow the calling handler to see whether the exception becomes an HTTP response or propagates.
+
+## Data and state
+
+- [`src/plat/ops.py`](src/plat/ops.py) defines module-level containers: `_WORKSPACES`, `_JOBS`, `_AUDIT`, `_METRICS`.
+
+Module-level dictionaries/lists live in a Python process. They can be fixtures or mutable state; inspect writes before treating them as persistent storage. A production extension would need to define persistence and concurrency behavior explicitly.
 
 ## Data flow and design decisions
 
@@ -95,6 +134,12 @@ A useful extension is a table-driven test that covers each condition just below,
 
 Trace these definitions and imports to explain the module boundary. Relative imports identify project code; package imports should be checked against the nearest manifest.
 
+### What does the operations plane add, and where is its limit
+
+[`src/plat/ops.py`](src/plat/ops.py) declares `GET /readyz`, `POST /workspaces`, `GET /workspaces`, `POST /workspaces/{workspace_id}/jobs`, `GET /jobs/{job_id}`, `POST /jobs/{job_id}/approve`, `GET /audit`, `GET /metrics`. Inspect the application’s `include_router` call for its URL prefix.
+
+Its state containers are `_WORKSPACES`, `_JOBS`, `_AUDIT`, `_METRICS`. The job-approval handler defines whether a target is accepted or refused; check that branch and the associated tests instead of treating a recorded job as a successful infrastructure apply.
+
 ## Setup and verification
 
 The following commands are derived from the checked-in dependency/test contracts. Execute them from the repository root; the block prepares a local environment, not a cloud deployment.
@@ -108,7 +153,7 @@ python -m pytest -q
 
 Python dependencies: [`requirements.txt`](requirements.txt).
 
-Test entry points: [`tests/test_gate.py`](tests/test_gate.py).
+Test entry points: [`tests/test_gate.py`](tests/test_gate.py), [`tests/test_ops.py`](tests/test_ops.py).
 
 Automation definitions: [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Read their triggers and job steps to determine what CI actually runs.
 
